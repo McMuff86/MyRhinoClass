@@ -5,6 +5,8 @@ using Eto.Forms;
 using Eto.Drawing;
 using Rhino;
 using MyRhinoClass;
+using Rhino.DocObjects;
+using Font = Eto.Drawing.Font;
 
 namespace MyRhinoClass.Views
 {
@@ -32,6 +34,19 @@ namespace MyRhinoClass.Views
         private Point? _dragStartPosition = null;
         private bool _isDragging = false;
         private const int DRAG_THRESHOLD = 5;
+        private readonly Dictionary<Guid, string> _lastLoggedLayer = new Dictionary<Guid, string>();
+
+        private class LayerItem
+        {
+            public string FullPath { get; set; }
+            public int Index { get; set; }
+            public Guid Id { get; set; }
+
+            public override string ToString()
+            {
+                return FullPath;
+            }
+        }
 
         public ClassesPanel()
         {
@@ -153,23 +168,101 @@ namespace MyRhinoClass.Views
             };
             _treeView.Columns.Add(nameColumn);
 
-            // Add column for layer
+            // Add column for layer with layer picker
             var layerColumn = new GridColumn
             {
                 HeaderText = "Layer",
-                DataCell = new TextBoxCell
+                DataCell = new ComboBoxCell
                 {
-                    Binding = new DelegateBinding<TreeGridItem, string>(
-                        r => r.Tag switch
+                    DataStore = GetAllLayerNames().Select(l => l.FullPath).ToList(),
+                    Binding = new DelegateBinding<TreeGridItem, object>(
+                        item =>
                         {
-                            RhinoClass _ => string.Empty,
-                            Rhino.DocObjects.RhinoObject ro => RhinoDoc.ActiveDoc?.Layers[ro.Attributes.LayerIndex]?.Name ?? string.Empty,
-                            _ => string.Empty
+                            var doc = RhinoDoc.ActiveDoc;
+                            if (doc != null && item.Tag is RhinoObject ro)
+                            {
+                                var currentLayer = doc.Layers[ro.Attributes.LayerIndex];
+                                RhinoApp.WriteLine($"[GETTER] Aktueller Layer für {ro.Id}: '{currentLayer.FullPath}' (Index: {ro.Attributes.LayerIndex})");
+
+                                // Gib direkt den Layer-Pfad zurück
+                                return currentLayer.FullPath;
+                            }
+                            return null;
+                        },
+                        (item, value) =>
+                        {
+                            RhinoApp.WriteLine($"[SETTER] Empfangener Wert: '{value}' (Typ: {value?.GetType().Name ?? "null"})");
+                            
+                            if (item?.Tag is RhinoObject ro)
+                            {
+                                try
+                                {
+                                    var doc = RhinoDoc.ActiveDoc;
+                                    if (doc == null) return;
+
+                                    // Konvertiere den Wert in einen String
+                                    string targetLayerName = value?.ToString();
+                                    if (string.IsNullOrEmpty(targetLayerName))
+                                    {
+                                        RhinoApp.WriteLine("[SETTER] Ungültiger Layer-Name (null oder leer)");
+                                        return;
+                                    }
+
+                                    // Finde den Layer-Index anhand des Namens
+                                    int targetLayerIndex = -1;
+                                    for (int i = 0; i < doc.Layers.Count; i++)
+                                    {
+                                        if (string.Equals(doc.Layers[i].FullPath, targetLayerName, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            targetLayerIndex = i;
+                                            break;
+                                        }
+                                    }
+
+                                    if (targetLayerIndex == -1)
+                                    {
+                                        RhinoApp.WriteLine($"[SETTER] Layer '{targetLayerName}' nicht gefunden");
+                                        return;
+                                    }
+
+                                    // Prüfe ob es wirklich eine Änderung ist
+                                    var currentLayer = doc.Layers[ro.Attributes.LayerIndex];
+                                    if (currentLayer.Index == targetLayerIndex)
+                                    {
+                                        RhinoApp.WriteLine($"[SETTER] Layer ist bereits '{targetLayerName}'");
+                                        return;
+                                    }
+
+                                    RhinoApp.WriteLine($"[SETTER] Ändere Layer für Objekt {ro.Id}:");
+                                    RhinoApp.WriteLine($"  Von: '{currentLayer.FullPath}' (Index: {ro.Attributes.LayerIndex})");
+                                    RhinoApp.WriteLine($"  Zu:  '{targetLayerName}' (Index: {targetLayerIndex})");
+
+                                    // Setze den neuen Layer
+                                    ro.Attributes.LayerIndex = targetLayerIndex;
+                                    
+                                    if (doc.Objects.ModifyAttributes(ro, ro.Attributes, true))
+                                    {
+                                        RhinoApp.WriteLine($"[SETTER] Layer-Änderung erfolgreich");
+                                        doc.Views.Redraw();
+                                        Application.Instance.AsyncInvoke(() => RefreshClassList());
+                                    }
+                                    else
+                                    {
+                                        RhinoApp.WriteLine("[SETTER] Fehler beim Ändern des Layers");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    RhinoApp.WriteLine($"[SETTER] Fehler: {ex.Message}\n{ex.StackTrace}");
+                                    MessageBox.Show($"Fehler beim Ändern des Layers: {ex.Message}", "Fehler", MessageBoxType.Error);
+                                }
+                            }
                         }
                     )
                 },
-                Width = 100,
-                Resizable = true
+                Width = 150,
+                Resizable = true,
+                Editable = true
             };
             _treeView.Columns.Add(layerColumn);
 
@@ -366,7 +459,7 @@ namespace MyRhinoClass.Views
                 }
                 else if (selectedItem.Tag is Rhino.DocObjects.RhinoObject rhinoObject)
                 {
-                    // Add to selection without clearing existing selection
+                    // For individual objects, add to selection without clearing existing selection
                     rhinoObject.Select(true);
                     UpdateObjectInfoLabel(rhinoObject);
                     doc.Views.Redraw();
@@ -1073,14 +1166,22 @@ namespace MyRhinoClass.Views
             var selectedItem = _treeView.SelectedItem as TreeGridItem;
             if (selectedItem?.Tag is RhinoClass selectedClass)
             {
-                // Clear existing selection before selecting class objects
-                var doc = RhinoDoc.ActiveDoc;
-                if (doc != null)
+                // Ask user if they want to keep existing selection
+                var result = MessageBox.Show(
+                    "Möchten Sie die bestehende Selektion beibehalten?\nJa = Zur Selektion hinzufügen\nNein = Neue Selektion",
+                    "Selektion",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxType.Question
+                );
+
+                if (result == DialogResult.No)
                 {
-                    doc.Objects.UnselectAll();
-                    SelectClassAndChildrenObjects(selectedClass);
-                    doc.Views.Redraw();
+                    // Clear existing selection only if user chooses to
+                    RhinoDoc.ActiveDoc?.Objects.UnselectAll();
                 }
+
+                SelectClassAndChildrenObjects(selectedClass);
+                RhinoDoc.ActiveDoc?.Views.Redraw();
             }
         }
 
@@ -1115,6 +1216,29 @@ namespace MyRhinoClass.Views
             
             // Unsubscribe from events
             RhinoDoc.ModifyObjectAttributes -= RhinoDoc_ModifyObjectAttributes;
+        }
+
+        private IEnumerable<LayerItem> GetAllLayerNames()
+        {
+            var doc = RhinoDoc.ActiveDoc;
+            if (doc == null)
+                return Enumerable.Empty<LayerItem>();
+
+            var layers = new List<LayerItem>();
+            for (int i = 0; i < doc.Layers.Count; i++)
+            {
+                var layer = doc.Layers[i];
+                var layerItem = new LayerItem 
+                { 
+                    FullPath = layer.FullPath,
+                    Index = i,
+                    Id = layer.Id
+                };
+                layers.Add(layerItem);
+                RhinoApp.WriteLine($"[LAYERS] Layer {i}: Name='{layer.FullPath}', Index={i}, ID={layer.Id}");
+            }
+
+            return layers.OrderBy(l => l.FullPath);
         }
     }
 } 
